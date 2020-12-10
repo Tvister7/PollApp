@@ -1,11 +1,13 @@
-import os
-import psycopg2
-from psycopg2.errors import DivisionByZero
-from dotenv import load_dotenv
+import datetime
+
+import pytz
+
+from connection_pool import get_connection
+import random
+from models.option import Option
+from models.poll import Poll
 import database
 
-
-DATABASE_PROMPT = ""
 MENU_PROMPT = """-- Менюшечка --
 
 1) Создать новый опрос
@@ -19,60 +21,82 @@ MENU_PROMPT = """-- Менюшечка --
 NEW_OPTION_PROMPT = "Введите новый выбор (или оставьте поле пустым, если закончили): "
 
 
-def prompt_create_poll(connection):
+def prompt_create_poll():
     poll_title = input("Введите название опроса: ")
     poll_owner = input("Введите имя создателя  опроса: ")
-    options = []
+    poll = Poll(poll_title, poll_owner)
+    poll.save()
 
     while new_option := input(NEW_OPTION_PROMPT):
-        options.append(new_option)
-
-    database.create_poll(connection, poll_title, poll_owner, options)
+        poll.add_option(new_option)
 
 
-def list_open_polls(connection):
-    polls = database.get_polls(connection)
-
-    for _id, title, owner in polls:
-        print(f"{_id}: {title} (создано пользователем {owner})")
+def list_open_polls():
+    for poll in Poll.all():
+        print(f"{poll.id}: {poll.title} (создано пользователем {poll.owner})")
 
 
-def prompt_vote_poll(connection):
+def prompt_vote_poll():
     poll_id = int(input("Введите номер опроса, где хотели бы проголосовать: "))
+    try:
+        _print_poll_options(Poll.get(poll_id).options)
 
-    poll_options = database.get_poll_details(connection, poll_id)
-    _print_poll_options(poll_options)
+        option_id = int(input("Выберете интересующий Вас пункт: "))
+        username = input("Введите свой ник: ")
 
-    option_id = int(input("Выберете интересующий Вас пункт: "))
-    username = input("Введите свой ник: ")
-    database.add_poll_vote(connection, username, option_id)
-
-
-def _print_poll_options(poll_with_options: list[database.PollWithOption]):
-    for option in poll_with_options:
-        print(f"{option[3]}: {option[4]}")
+        Option.get(option_id).vote(username)
+    except TypeError:
+        print("Нет опроса под этим номером!")
 
 
-def show_poll_votes(connection):
+def _print_poll_options(options: list[Option]):
+    for option in options:
+        print(f"{option.id}: {option.text}")
+
+
+def show_poll_votes():
     poll_id = int(input("Какой опрос хотите посмотреть?: "))
     try:
-        # This gives us count and percentage of votes for each option in a poll
-        poll_and_votes = database.get_poll_and_vote_results(connection, poll_id)
-    except DivisionByZero:
-        print("В нем ещё нет голосов.")
-    else:
-        for _id, option_text, count, percentage in poll_and_votes:
-            print(f"Пункт {option_text} получил {count} голосов ({percentage:.1f}% от общего числа)")
+        options = Poll.get(poll_id).options
+        votes_per_option = [len(option.votes) for option in options]
+        total_votes = sum(votes_per_option)
+        try:
+            for option, votes in zip(options, votes_per_option):
+                percentage = votes / total_votes * 100
+                if votes % 10 in [2, 3, 4]:
+                    print(f"Пункт {option.text} получил {votes} голоса ({percentage:.1f}% от общего числа)")
+                elif votes % 10 == 1:
+                    print(f"Пункт {option.text} получил {votes} голос ({percentage:.1f}% от общего числа)")
+                else:
+                    print(f"Пункт {option.text} получил {votes} голосов ({percentage:.1f}% от общего числа)")
+
+        except ZeroDivisionError:
+            print("В нем ещё нет голосов.")
+
+        vote_log = input("Хотите увидеть логи? (да/Нет): ")
+        if vote_log == "да":
+            _print_vote_for_options(options)
+    except TypeError:
+        print("Нет опроса под этим номером!")
 
 
-def randomize_poll_winner(connection):
-    poll_id = int(input("Введите название опроса, где хотите выбрать победителя: "))
-    poll_options = database.get_poll_details(connection, poll_id)
-    _print_poll_options(poll_options)
+def _print_vote_for_options(options: list[Option]):
+    for option in options:
+        print(f"-- {option.text} --")
+        for vote in option.votes:
+            naive_datetime = datetime.datetime.utcfromtimestamp(vote[2])
+            utc_date = pytz.utc.localize(naive_datetime)
+            local_date = utc_date.astimezone(pytz.timezone("Europe/Moscow")).strftime("%d.%m.%Y %H:%M")
+            print(f"\t- {vote[0]} в {local_date}")
 
-    option_id = int(input("""Введите номер выигрышного ответа, 
-                         победитель будет выбран из проголосавших за этот вариант: """))
-    winner = database.get_random_poll_vote(connection, option_id)
+
+def randomize_poll_winner():
+    poll_id = int(input("Введите номер опроса, где хотите выбрать победителя: "))
+    _print_poll_options(Poll.get(poll_id).options)
+
+    option_id = int(input("Введите номер выигрышного ответа, победитель будет выбран из проголосавших за него: "))
+    votes = Option.get(option_id).votes
+    winner = random.choice(votes)
     print(f"Произвольно выбранный победитель: {winner[0]}.")
 
 
@@ -86,19 +110,14 @@ MENU_OPTIONS = {
 
 
 def menu():
-    database_uri = input(DATABASE_PROMPT)
-    if not database_uri:
-        load_dotenv()
-        database_uri = os.environ["DATABASE_URI"]
+    with get_connection() as connection:
+        database.create_tables(connection)
 
-    connection = psycopg2.connect(database_uri)
-    database.create_tables(connection)
-
-    while (selection := input(MENU_PROMPT)) != "6":
-        try:
-            MENU_OPTIONS[selection](connection)
-        except KeyError:
-            print("Выбрана несуществующая опция, попробуйте еще раз!")
+        while (selection := input(MENU_PROMPT)) != "6":
+            try:
+                MENU_OPTIONS[selection]()
+            except KeyError:
+                print("Выбрана несуществующая опция, попробуйте еще раз!")
 
 
 menu()
